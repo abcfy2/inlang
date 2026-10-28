@@ -197,6 +197,37 @@ test.each([
 	]);
 });
 
+test.each([
+	'{true && <script>import * as m from "./messages"; document.title = m.foo();</script>}',
+	'{true && <script src="./external.js" />}',
+	'{true && <script src={"./external.js"}></script>}',
+	'{true && <div><script src=`./external.js` /></div>}',
+	'{true && <div>{true && <script src=./external.js />}</div>}',
+	'<Component content={true && <script src="./external.js" />} />',
+	'<Component content=`${true && <script src="./external.js" />}` />',
+])("withholds unused fixes for nested scripts: %s", async (content) => {
+	const result = await analyze(content);
+	const start = content.indexOf("<script");
+	expect(result.status).toBe("incomplete");
+	expect(result.issues).toContainEqual({
+		path: "src/Page.astro",
+		reason: "Nested Astro scripts cannot be analyzed.",
+		start: { line: 1, column: start },
+		end: { line: 1, column: start + "<script".length },
+	});
+});
+
+test("does not treat script text in strings or comments as nested scripts", async () => {
+	const result = await analyze(`---
+import { m } from "./messages";
+---
+<p>{m.real({ text: "<script>" })}</p>
+<p title=\`literal <script>\` />
+{true && <div><!-- <script>m.commented()</script> -->{m.nested()}</div>}`);
+	expect(result.status).toBe("complete");
+	expect(new Set(result.usedBundleIds)).toEqual(new Set(["real", "nested"]));
+});
+
 test("analyzes top-level returns in the frontmatter", async () => {
 	const result = await analyze(`---
 import { m } from './messages';

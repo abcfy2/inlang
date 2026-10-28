@@ -32,6 +32,7 @@ const isSpace = (c: string | undefined) =>
 function findExpressionEnd(
 	content: string,
 	open: number,
+	failures: AstroFailure[],
 	edits?: AstroEdit[],
 ): number | undefined {
 	let depth = 0;
@@ -45,7 +46,7 @@ function findExpressionEnd(
 			continue;
 		}
 		if (c === "`") {
-			const end = skipTemplate(content, i, edits);
+			const end = skipTemplate(content, i, failures, edits);
 			if (end === undefined) return undefined;
 			i = end;
 			continue;
@@ -67,7 +68,7 @@ function findExpressionEnd(
 			while (before > open && isSpace(content[before])) before--;
 			if (before === open || /[([{=,:?!;&|>]/.test(content[before]!)) {
 				const count = edits?.length ?? 0;
-				const end = skipElement(content, i, edits);
+				const end = skipElement(content, i, failures, edits);
 				if (end !== undefined) {
 					i = end;
 					continue;
@@ -99,6 +100,7 @@ function skipQuoted(content: string, start: number): number | undefined {
 function skipTemplate(
 	content: string,
 	start: number,
+	failures: AstroFailure[],
 	edits?: AstroEdit[],
 ): number | undefined {
 	for (let i = start + 1; i < content.length; i++) {
@@ -106,7 +108,7 @@ function skipTemplate(
 		if (c === "\\") i++;
 		else if (c === "`") return i + 1;
 		else if (c === "$" && content[i + 1] === "{") {
-			const close = findExpressionEnd(content, i + 1, edits);
+			const close = findExpressionEnd(content, i + 1, failures, edits);
 			if (close === undefined) return undefined;
 			i = close;
 		}
@@ -118,10 +120,17 @@ function skipTemplate(
 function skipElement(
 	content: string,
 	start: number,
+	failures: AstroFailure[],
 	edits?: AstroEdit[],
 ): number | undefined {
 	let i = start + 1;
 	while (/[a-zA-Z0-9_.:-]/.test(content[i] ?? "")) i++;
+	if (content.slice(start + 1, i).toLowerCase() === "script")
+		failures.push({
+			reason: "Nested Astro scripts cannot be analyzed.",
+			start,
+			end: i,
+		});
 	while (i < content.length && content[i] !== ">") {
 		if (isSpace(content[i])) {
 			i++;
@@ -133,7 +142,7 @@ function skipElement(
 			while (isSpace(content[value])) value++;
 			if (!content.startsWith("...", value))
 				edits?.push({ start: i + 1, end: i + 1, code: "..." });
-			const end = findExpressionEnd(content, i, edits);
+			const end = findExpressionEnd(content, i, failures, edits);
 			if (end === undefined) return undefined;
 			i = end + 1;
 			continue;
@@ -147,7 +156,7 @@ function skipElement(
 		while (isSpace(content[i])) i++;
 		const value = content[i];
 		if (value === "{") {
-			const end = findExpressionEnd(content, i, edits);
+			const end = findExpressionEnd(content, i, failures, edits);
 			if (end === undefined) return undefined;
 			i = end + 1;
 		} else if (value === "'" || value === '"') {
@@ -156,7 +165,7 @@ function skipElement(
 			i = end + 1;
 		} else if (value === "`") {
 			edits?.push({ start: i, end: i, code: "{" });
-			const end = skipTemplate(content, i, edits);
+			const end = skipTemplate(content, i, failures, edits);
 			if (end === undefined) return undefined;
 			edits?.push({ start: end, end, code: "}" });
 			i = end;
@@ -189,11 +198,11 @@ function skipElement(
 			const close = content.indexOf(">", i + 2);
 			return close === -1 ? undefined : close + 1;
 		} else if (content[i] === "<" && /[a-zA-Z>]/.test(content[i + 1] ?? "")) {
-			const end = skipElement(content, i, edits);
+			const end = skipElement(content, i, failures, edits);
 			if (end === undefined) return undefined;
 			i = end;
 		} else if (content[i] === "{") {
-			const end = findExpressionEnd(content, i, edits);
+			const end = findExpressionEnd(content, i, failures, edits);
 			if (end === undefined) return undefined;
 			i = end + 1;
 		} else {
@@ -253,7 +262,7 @@ export function extractAstro(content: string): AstroExtraction {
 	/** Collects the `{…}` expression at `at` and returns the index after it. */
 	const collectExpression = (at: number): number | undefined => {
 		const edits: AstroEdit[] = [];
-		const close = findExpressionEnd(content, at, edits);
+		const close = findExpressionEnd(content, at, failures, edits);
 		if (close === undefined) return undefined;
 		expressions.push(expressionSegment(content, at + 1, close, edits));
 		return close + 1;
@@ -377,7 +386,7 @@ export function extractAstro(content: string): AstroExtraction {
 				k = closeQ + 1;
 			} else if (vc === "`") {
 				const edits: AstroEdit[] = [];
-				const end = skipTemplate(content, value, edits);
+				const end = skipTemplate(content, value, failures, edits);
 				if (end === undefined) return fail("unterminated attribute value");
 				expressions.push(expressionSegment(content, value, end, edits));
 				k = end;
