@@ -147,7 +147,9 @@ renderLabel(m);
 
 Svelte files use the Svelte compiler parser. Both instance and module scripts (JavaScript or TypeScript), template expressions, blocks, snippets, component references and directives are analyzed. Dynamic references, external scripts, unsupported script languages and parse failures make analysis incomplete. No Svelte-specific configuration is needed: include `.svelte` files in the same complete source snapshot.
 
-This release does not implement TypeScript data-flow analysis or resolve all module graphs. Reexports with a source module, TypeScript import assignments, and all dynamic/CommonJS imports are incomplete. Vue and Astro files are unsupported and make the snapshot incomplete. Do not omit relevant unsupported files to obtain a complete result.
+This release does not implement TypeScript data-flow analysis or resolve all module graphs. Reexports with a source module, TypeScript import assignments, and all dynamic/CommonJS imports are incomplete. Vue files are unsupported and make the snapshot incomplete. Do not omit relevant unsupported files to obtain a complete result.
+
+Astro files use a self-contained scanner: the frontmatter and each inline script are parsed as TypeScript, and every `{…}` expression in the template or an attribute (`title={m.someKey()}`, `set:html`) is parsed on its own. Quoted attribute values, `<style>` blocks and HTML comments are literal text. External scripts and input the scanner cannot delimit make the analysis incomplete, as everywhere else. No Astro-specific configuration is needed: include `.astro` files in the same complete source snapshot.
 
 The matcher also reports incomplete analysis for parse errors, a file over two million characters, or a snapshot over 10,000 files or 50 million characters. It does not silently skip these files.
 

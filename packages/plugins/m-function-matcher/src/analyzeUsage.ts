@@ -1,5 +1,6 @@
 import { parse as parseSvelte } from "svelte/compiler";
 import { parse } from "@babel/parser";
+import { extractAstro } from "./astro.js";
 import type {
 	AnalyzeUsage,
 	UsageAnalysis,
@@ -84,6 +85,17 @@ const parserPlugins = (path: string): ParserPlugins[] => {
 		[...base, ["decorators", { decoratorsBeforeExport: false }], "decoratorAutoAccessors"],
 	];
 };
+/** Shifts a program parsed from an Astro segment to the original file's offsets. */
+const shiftOffsets = (node: Node, delta: number): void => {
+	if (typeof node.start === "number") node.start += delta;
+	if (typeof node.end === "number") node.end += delta;
+	for (const [key, value] of Object.entries(node)) {
+		if (key === "loc" || key === "css" || key.endsWith("Comments")) continue;
+		if (isNode(value)) shiftOffsets(value, delta);
+		else if (Array.isArray(value))
+			for (const child of value) if (isNode(child)) shiftOffsets(child, delta);
+	}
+};
 const messageModule = (value: unknown): boolean =>
 	typeof value === "string" &&
 	/(?:^|\/)(?:messages(?:\/|\.|$)|paraglide(?:\/|$))/.test(value);
@@ -165,11 +177,11 @@ export const analyzeUsage: AnalyzeUsage = ({ files }) => {
 						: {}),
 				});
 		};
-		if (!/\.(?:[jt]sx?|m[jt]s|svelte)$/i.test(file.path)) {
+		if (!/\.(?:[jt]sx?|m[jt]s|svelte|astro)$/i.test(file.path)) {
 			issues.push({
 				path: file.path,
 				reason:
-					"Unsupported source format. Supply ESM JavaScript, TypeScript or Svelte files.",
+					"Unsupported source format. Supply ESM JavaScript, TypeScript, Svelte or Astro files.",
 			});
 			continue;
 		}
@@ -183,7 +195,62 @@ export const analyzeUsage: AnalyzeUsage = ({ files }) => {
 		let root: Node;
 		let programs: Node[];
 		try {
-			if (/\.svelte$/i.test(file.path)) {
+			if (/\.astro$/i.test(file.path)) {
+				const extracted = extractAstro(file.content);
+				if (extracted.error !== undefined) throw new Error(extracted.error);
+				for (const failure of extracted.failures)
+					unresolve(failure.reason, {
+						type: "AstroConstruct",
+						start: failure.start,
+						end: failure.end,
+					});
+				const parsed: Node[] = [];
+				let failure: unknown;
+				for (const segment of extracted.segments) {
+					for (const plugins of parserPlugins("_.ts")) {
+						try {
+							const ast = parse(segment.code, {
+								sourceType: "module",
+								plugins,
+								allowReturnOutsideFunction: true,
+							});
+							shiftOffsets(ast.program as unknown as Node, segment.original);
+							parsed.push(ast.program as unknown as Node);
+							break;
+						} catch (error) {
+							failure ??= error;
+						}
+					}
+				}
+				for (const expression of extracted.expressions) {
+					// the `\n;[` wrapper makes the expression a standalone array
+					// element: nodes at generated offsets >= 3 map back to the original
+					const code = `\n;[${expression.code}];\n`;
+					for (const plugins of parserPlugins("_.tsx")) {
+						try {
+							const ast = parse(code, { sourceType: "module", plugins });
+							shiftOffsets(
+								ast.program as unknown as Node,
+								expression.original - 3,
+							);
+							parsed.push(ast.program as unknown as Node);
+							break;
+						} catch (error) {
+							failure ??= error;
+						}
+					}
+				}
+				if (
+					parsed.length !==
+					extracted.segments.length + extracted.expressions.length
+				)
+					throw failure;
+				programs = parsed;
+				root = {
+					type: "Program",
+					body: parsed.flatMap((p) => p.body as Node[]),
+				};
+			} else if (/\.svelte$/i.test(file.path)) {
 				root = parseSvelte(file.content, { modern: true }) as unknown as Node;
 				const scripts = [root.module, root.instance].filter(isNode);
 				programs = scripts.map((script) => script.content as Node);
