@@ -1,6 +1,6 @@
 import { parse as parseSvelte } from "svelte/compiler";
 import { parse } from "@babel/parser";
-import { extractAstro } from "./astro.js";
+import { extractAstro, type AstroSegment } from "./astro.js";
 import type {
 	AnalyzeUsage,
 	UsageAnalysis,
@@ -85,22 +85,46 @@ const parserPlugins = (path: string): ParserPlugins[] => {
 		[...base, ["decorators", { decoratorsBeforeExport: false }], "decoratorAutoAccessors"],
 	];
 };
-/** Shifts a program parsed from an Astro segment to the original file's offsets. */
-const shiftOffsets = (node: Node, delta: number): void => {
-	if (typeof node.start === "number") node.start += delta;
-	if (typeof node.end === "number") node.end += delta;
+const originalOffset = (
+	offset: number,
+	delta: number,
+	offsets?: AstroSegment["offsets"],
+): number => {
+	let low = 0;
+	let high = offsets?.length ?? 0;
+	while (low < high) {
+		const middle = (low + high) >> 1;
+		if (offsets![middle]!.generated <= offset) low = middle + 1;
+		else high = middle;
+	}
+	const checkpoint = offsets?.[low - 1];
+	return (
+		offset + delta - (checkpoint ? checkpoint.generated - checkpoint.original : 0)
+	);
+};
+/** Maps normalized Astro AST offsets back to the original source. */
+const shiftOffsets = (
+	node: Node,
+	delta: number,
+	offsets?: AstroSegment["offsets"],
+): void => {
+	if (typeof node.start === "number")
+		node.start = originalOffset(node.start, delta, offsets);
+	if (typeof node.end === "number")
+		node.end = originalOffset(node.end, delta, offsets);
 	for (const [key, value] of Object.entries(node)) {
 		if (key === "loc" || key === "css" || key.endsWith("Comments")) continue;
-		if (isNode(value)) shiftOffsets(value, delta);
+		if (isNode(value)) shiftOffsets(value, delta, offsets);
 		else if (Array.isArray(value))
-			for (const child of value) if (isNode(child)) shiftOffsets(child, delta);
+			for (const child of value)
+				if (isNode(child)) shiftOffsets(child, delta, offsets);
 	}
 };
 const messageModule = (value: unknown): boolean =>
 	typeof value === "string" &&
 	/(?:^|\/)(?:messages(?:\/|\.|$)|paraglide(?:\/|$))/.test(value);
 
-/** Conservative JS/TS/Svelte analysis. Unsupported files and object escapes withhold unused fixes. */
+/** Unsupported source syntax and object escapes withhold unused fixes. */
 export const analyzeUsage: AnalyzeUsage = ({ files }) => {
 	if (
 		files.length > 10_000 ||
@@ -226,12 +250,17 @@ export const analyzeUsage: AnalyzeUsage = ({ files }) => {
 					// the `\n;[` wrapper makes the expression a standalone array
 					// element: nodes at generated offsets >= 3 map back to the original
 					const code = `\n;[${expression.code}];\n`;
+					const offsets = expression.offsets?.map(({ generated, original }) => ({
+						generated: generated + 3,
+						original: original + 3,
+					}));
 					for (const plugins of parserPlugins("_.tsx")) {
 						try {
 							const ast = parse(code, { sourceType: "module", plugins });
 							shiftOffsets(
 								ast.program as unknown as Node,
 								expression.original - 3,
+								offsets,
 							);
 							parsed.push(ast.program as unknown as Node);
 							break;

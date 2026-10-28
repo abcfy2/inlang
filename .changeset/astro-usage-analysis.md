@@ -2,4 +2,4 @@
 "@inlang/plugin-m-function-matcher": minor
 ---
 
-Analyze usages in Astro (`.astro`) files: frontmatter and inline scripts as TypeScript, plus template and attribute `{…}` expressions, with references located in the original file. Quoted attribute values, `<style>` blocks and HTML comments are literal; external scripts and input the scanner cannot delimit keep the analysis incomplete.
+Analyze usages in Astro (`.astro`) files: frontmatter and inline scripts as TypeScript, plus template and attribute `{…}` expressions, backtick attribute interpolations and nested Astro shorthand attributes, with references located in the original file. Single- and double-quoted attribute values, `<style>` blocks and HTML comments are literal; external scripts (including self-closing tags and expression or unquoted `src` values) and input the scanner cannot delimit keep the analysis incomplete.

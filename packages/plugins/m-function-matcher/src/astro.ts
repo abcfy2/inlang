@@ -7,7 +7,12 @@
  * template literals and comments. Anything the scanner cannot confidently
  * delimit makes the extraction fail so the analysis stays incomplete.
  */
-export type AstroSegment = { code: string; original: number };
+export type AstroSegment = {
+	code: string;
+	original: number;
+	offsets?: { generated: number; original: number }[];
+};
+type AstroEdit = { start: number; end: number; code: string };
 export type AstroFailure = { reason: string; start: number; end: number };
 export type AstroExtraction = {
 	/** Verbatim program text: the frontmatter and each inline script. */
@@ -24,7 +29,11 @@ const isSpace = (c: string | undefined) =>
 	c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
 
 /** The index of the `}` matching `content[open]`, or undefined at the end of input. */
-function findExpressionEnd(content: string, open: number): number | undefined {
+function findExpressionEnd(
+	content: string,
+	open: number,
+	edits?: AstroEdit[],
+): number | undefined {
 	let depth = 0;
 	let i = open;
 	while (i < content.length) {
@@ -36,7 +45,7 @@ function findExpressionEnd(content: string, open: number): number | undefined {
 			continue;
 		}
 		if (c === "`") {
-			const end = skipTemplate(content, i);
+			const end = skipTemplate(content, i, edits);
 			if (end === undefined) return undefined;
 			i = end;
 			continue;
@@ -52,6 +61,19 @@ function findExpressionEnd(content: string, open: number): number | undefined {
 			if (close === -1) return undefined;
 			i = close + 2;
 			continue;
+		}
+		if (c === "<" && /[a-zA-Z>]/.test(content[i + 1] ?? "")) {
+			let before = i - 1;
+			while (before > open && isSpace(content[before])) before--;
+			if (before === open || /[([{=,:?!;&|>]/.test(content[before]!)) {
+				const count = edits?.length ?? 0;
+				const end = skipElement(content, i, edits);
+				if (end !== undefined) {
+					i = end;
+					continue;
+				}
+				if (edits) edits.length = count;
+			}
 		}
 		if (c === "{") depth++;
 		else if (c === "}") {
@@ -74,18 +96,137 @@ function skipQuoted(content: string, start: number): number | undefined {
 }
 
 /** The index after the closing backtick, interpolations included. */
-function skipTemplate(content: string, start: number): number | undefined {
+function skipTemplate(
+	content: string,
+	start: number,
+	edits?: AstroEdit[],
+): number | undefined {
 	for (let i = start + 1; i < content.length; i++) {
 		const c = content[i];
 		if (c === "\\") i++;
 		else if (c === "`") return i + 1;
 		else if (c === "$" && content[i + 1] === "{") {
-			const close = findExpressionEnd(content, i + 1);
+			const close = findExpressionEnd(content, i + 1, edits);
 			if (close === undefined) return undefined;
 			i = close;
 		}
 	}
 	return undefined;
+}
+
+/** Normalizes Astro-only markup inside an expression without losing source positions. */
+function skipElement(
+	content: string,
+	start: number,
+	edits?: AstroEdit[],
+): number | undefined {
+	let i = start + 1;
+	while (/[a-zA-Z0-9_.:-]/.test(content[i] ?? "")) i++;
+	while (i < content.length && content[i] !== ">") {
+		if (isSpace(content[i])) {
+			i++;
+			continue;
+		}
+		if (content.startsWith("/>", i)) return i + 2;
+		if (content[i] === "{") {
+			let value = i + 1;
+			while (isSpace(content[value])) value++;
+			if (!content.startsWith("...", value))
+				edits?.push({ start: i + 1, end: i + 1, code: "..." });
+			const end = findExpressionEnd(content, i, edits);
+			if (end === undefined) return undefined;
+			i = end + 1;
+			continue;
+		}
+		const attrStart = i;
+		while (i < content.length && !/[\s=/>]/.test(content[i]!)) i++;
+		if (i === attrStart) return undefined;
+		while (isSpace(content[i])) i++;
+		if (content[i] !== "=") continue;
+		i++;
+		while (isSpace(content[i])) i++;
+		const value = content[i];
+		if (value === "{") {
+			const end = findExpressionEnd(content, i, edits);
+			if (end === undefined) return undefined;
+			i = end + 1;
+		} else if (value === "'" || value === '"') {
+			const end = content.indexOf(value, i + 1);
+			if (end === -1) return undefined;
+			i = end + 1;
+		} else if (value === "`") {
+			edits?.push({ start: i, end: i, code: "{" });
+			const end = skipTemplate(content, i, edits);
+			if (end === undefined) return undefined;
+			edits?.push({ start: end, end, code: "}" });
+			i = end;
+		} else {
+			edits?.push({ start: i, end: i, code: '"' });
+			while (
+				i < content.length &&
+				!isSpace(content[i]) &&
+				content[i] !== ">" &&
+				!content.startsWith("/>", i)
+			)
+				i++;
+			edits?.push({ start: i, end: i, code: '"' });
+		}
+	}
+	if (content[i] !== ">") return undefined;
+	i++;
+	while (i < content.length) {
+		if (content.startsWith("<!--", i)) {
+			const close = content.indexOf("-->", i + 4);
+			if (close === -1) return undefined;
+			const end = close + 3;
+			edits?.push({
+				start: i,
+				end,
+				code: content.slice(i, end).replace(/[^\r\n]/g, " "),
+			});
+			i = end;
+		} else if (content.startsWith("</", i)) {
+			const close = content.indexOf(">", i + 2);
+			return close === -1 ? undefined : close + 1;
+		} else if (content[i] === "<" && /[a-zA-Z>]/.test(content[i + 1] ?? "")) {
+			const end = skipElement(content, i, edits);
+			if (end === undefined) return undefined;
+			i = end;
+		} else if (content[i] === "{") {
+			const end = findExpressionEnd(content, i, edits);
+			if (end === undefined) return undefined;
+			i = end + 1;
+		} else {
+			i++;
+		}
+	}
+	return undefined;
+}
+
+function expressionSegment(
+	content: string,
+	start: number,
+	end: number,
+	edits: AstroEdit[],
+): AstroSegment {
+	if (edits.length === 0)
+		return { code: content.slice(start, end), original: start };
+	const chunks: string[] = [];
+	const offsets: NonNullable<AstroSegment["offsets"]> = [];
+	let cursor = start;
+	let added = 0;
+	for (const edit of edits) {
+		chunks.push(content.slice(cursor, edit.start), edit.code);
+		added += edit.code.length - (edit.end - edit.start);
+		if (edit.start === edit.end)
+			offsets.push({
+				generated: edit.end - start + added,
+				original: edit.end - start,
+			});
+		cursor = edit.end;
+	}
+	chunks.push(content.slice(cursor, end));
+	return { code: chunks.join(""), original: start, offsets };
 }
 
 /** The next `/</name/i` match at or after `from`, like `</script`. */
@@ -111,9 +252,10 @@ export function extractAstro(content: string): AstroExtraction {
 	});
 	/** Collects the `{…}` expression at `at` and returns the index after it. */
 	const collectExpression = (at: number): number | undefined => {
-		const close = findExpressionEnd(content, at);
+		const edits: AstroEdit[] = [];
+		const close = findExpressionEnd(content, at, edits);
 		if (close === undefined) return undefined;
-		expressions.push({ code: content.slice(at + 1, close), original: at + 1 });
+		expressions.push(expressionSegment(content, at + 1, close, edits));
 		return close + 1;
 	};
 	let i = 0;
@@ -218,6 +360,8 @@ export function extractAstro(content: string): AstroExtraction {
 				continue;
 			}
 			const attrName = content.slice(attrStart, k);
+			if (attrName === "src" && name.toLowerCase() === "script")
+				external = true;
 			let value = k;
 			while (value < content.length && isSpace(content[value])) value++;
 			if (content[value] !== "=") {
@@ -230,13 +374,13 @@ export function extractAstro(content: string): AstroExtraction {
 			if (vc === '"' || vc === "'") {
 				const closeQ = content.indexOf(vc, value + 1);
 				if (closeQ === -1) return fail("unterminated attribute value");
-				if (
-					attrName === "src" &&
-					name.toLowerCase() === "script" &&
-					closeQ > value + 1
-				)
-					external = true;
 				k = closeQ + 1;
+			} else if (vc === "`") {
+				const edits: AstroEdit[] = [];
+				const end = skipTemplate(content, value, edits);
+				if (end === undefined) return fail("unterminated attribute value");
+				expressions.push(expressionSegment(content, value, end, edits));
+				k = end;
 			} else if (vc === "{") {
 				const next = collectExpression(value);
 				if (next === undefined) return fail("unterminated expression");
@@ -271,16 +415,16 @@ export function extractAstro(content: string): AstroExtraction {
 			i = end + 1;
 			continue;
 		}
+		if (lower === "script" && external) {
+			failures.push({
+				reason: "External Astro scripts cannot be analyzed.",
+				start: i,
+				end: k,
+			});
+			i = k;
+			continue;
+		}
 		if (lower === "script" && !selfClosed) {
-			if (external) {
-				failures.push({
-					reason: "External Astro scripts cannot be analyzed.",
-					start: i,
-					end: k,
-				});
-				i = k;
-				continue;
-			}
 			const close = closingTag(content, "script", k);
 			if (close === undefined) return fail("unterminated <script> block");
 			const end = content.indexOf(">", close);

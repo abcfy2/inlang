@@ -81,6 +81,122 @@ import { m } from './messages';
 	);
 });
 
+test("analyzes template-literal attributes without treating quoted or escaped text as usages", async () => {
+	const content = [
+		"---",
+		"import { m } from './messages';",
+		"---",
+		'<p title=`${m.title({ text: "}" })} \\${m.literal()}`',
+		' data-nested=`outer ${`inner ${m.nested()}`}`',
+		' data-quoted="${m.quoted()}">{m.body()}</p>',
+	].join("\n");
+	const result = await analyze(content);
+	expect(result.status).toBe("complete");
+	expect(new Set(result.usedBundleIds)).toEqual(
+		new Set(["title", "nested", "body"]),
+	);
+	expect(result.references).toContainEqual({
+		bundleId: "nested",
+		path: "src/Page.astro",
+		start: { line: 5, column: 31 },
+		end: { line: 5, column: 41 },
+	});
+});
+
+test("normalizes nested Astro markup while preserving message reference locations", async () => {
+	const content = [
+		"---",
+		"import { m } from './messages';",
+		"---",
+		"<ul>{items.map(item => <li {item}",
+		' title=`${m.title()}` data-static=plain>',
+		'<!-- } " {m.commented()}',
+		"still literal -->",
+		"Don't skip {m.body()}",
+		"</li>)}</ul>",
+		"<p>{m.after()}</p>",
+	].join("\n");
+	const result = await analyze(content);
+	expect(result.status).toBe("complete");
+	expect(new Set(result.usedBundleIds)).toEqual(
+		new Set(["title", "body", "after"]),
+	);
+	expect(result.references).toEqual(
+		expect.arrayContaining([
+			{
+				bundleId: "title",
+				path: "src/Page.astro",
+				start: { line: 5, column: 10 },
+				end: { line: 5, column: 19 },
+			},
+			{
+				bundleId: "body",
+				path: "src/Page.astro",
+				start: { line: 8, column: 12 },
+				end: { line: 8, column: 20 },
+			},
+			{
+				bundleId: "after",
+				path: "src/Page.astro",
+				start: { line: 10, column: 4 },
+				end: { line: 10, column: 13 },
+			},
+		]),
+	);
+});
+
+test.each(["{m}", "{...m}"])(
+	"retains namespace escapes in nested Astro attributes: %s",
+	async (attribute) => {
+		const content = `{items.map(item => <li ${attribute} title={m[key]()} />)}`;
+		const result = await analyze(content);
+		expect(result.status).toBe("incomplete");
+		expect(result.issues).toEqual(
+			expect.arrayContaining([
+				{
+					path: "src/Page.astro",
+					reason: "Dynamic message access cannot be resolved.",
+					start: { line: 1, column: content.indexOf("m[key]") },
+					end: { line: 1, column: content.indexOf("m[key]") + 6 },
+				},
+			]),
+		);
+		expect(result.issues).toHaveLength(2);
+	},
+);
+
+test.each([
+	"{count < limit ? m.less() : m.more()}",
+	"{(<T,>(value: T) => m.less())(item)}",
+	"{(<T extends string>(value: T) => m.less())(item)}",
+])("preserves JavaScript comparisons and TypeScript generics: %s", async (content) => {
+	const result = await analyze(content);
+	expect(result.status).toBe("complete");
+	expect(result.usedBundleIds).toContain("less");
+});
+
+test.each([
+	'<script src="./external.js"></script>',
+	"<script src=./external.js></script>",
+	'<script src={"./external.js"}></script>',
+	'<script src=`./external.js`></script>',
+	'<script src="./external.js" />',
+	"<script src=./external.js />",
+	'<script src={"./external.js"} />',
+	'<script src=`./external.js` />',
+])("withholds unused fixes for every external script form: %s", async (script) => {
+	const result = await analyze(script);
+	expect(result.status).toBe("incomplete");
+	expect(result.issues).toEqual([
+		{
+			path: "src/Page.astro",
+			reason: "External Astro scripts cannot be analyzed.",
+			start: { line: 1, column: 0 },
+			end: { line: 1, column: script.indexOf(">") + 1 },
+		},
+	]);
+});
+
 test("analyzes top-level returns in the frontmatter", async () => {
 	const result = await analyze(`---
 import { m } from './messages';
