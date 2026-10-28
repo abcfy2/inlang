@@ -19,6 +19,47 @@ const label = m.frontmatter();
 	);
 });
 
+test.each([
+	{ name: "byte-order mark", prefix: "\uFEFF" },
+	{ name: "leading newlines", prefix: "\n\n" },
+	{ name: "leading spaces and newlines", prefix: "  \n" },
+])("detects the frontmatter fence after a $name", async ({ prefix }) => {
+	const result = await analyze(`${prefix}---
+import { m } from './messages';
+const title = m.fenced();
+---
+<h1>{m.template()}</h1>`);
+	expect(result.status).toBe("complete");
+	expect(new Set(result.usedBundleIds)).toEqual(
+		new Set(["fenced", "template"])
+	);
+});
+
+test("keeps the frontmatter open across fence lines in template literals", async () => {
+	const result = await analyze(`---
+import { m } from './messages';
+const md = \`
+---
+section
+\`;
+const title = m.markdown();
+---
+<p>{m.body()}</p>`);
+	expect(result.status).toBe("complete");
+	expect(new Set(result.usedBundleIds)).toEqual(
+		new Set(["markdown", "body"])
+	);
+});
+
+test.each(["Style", "STYLE", "sTyLe"])(
+	"treats capitalized %s tags as components with expression children",
+	async (tag) => {
+		const result = await analyze(`<${tag}>{m.slot()}</${tag}><p>{m.body()}</p>`);
+		expect(result.status).toBe("complete");
+		expect(new Set(result.usedBundleIds)).toEqual(new Set(["slot", "body"]));
+	},
+);
+
 test("analyzes inline scripts, set:html and define:vars expressions", async () => {
 	const result = await analyze(`---
 import { m } from './messages';

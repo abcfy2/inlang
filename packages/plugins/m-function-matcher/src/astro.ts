@@ -249,6 +249,72 @@ function closingTag(
 	return pattern.exec(content)?.index;
 }
 
+/**
+ * The offset of the closing `---` fence line, ignoring fence lines inside
+ * strings, template literals and comments.
+ */
+function frontmatterClose(content: string, from: number): number | undefined {
+	let quote = "";
+	let comment: "" | "line" | "block" = "";
+	let depth = 0;
+	const templates: number[] = [];
+	let i = from;
+	while (i < content.length) {
+		const c = content[i]!;
+		if (comment === "line") {
+			if (c === "\n") comment = "";
+			i++;
+		} else if (comment === "block") {
+			if (c === "*" && content[i + 1] === "/") {
+				comment = "";
+				i += 2;
+			} else i++;
+		} else if (quote === "'" || quote === '"') {
+			if (c === "\\") i += 2;
+			else if (c === quote) {
+				quote = "";
+				i++;
+			} else i++;
+		} else if (quote === "`") {
+			if (c === "\\") i += 2;
+			else if (c === "`") {
+				quote = "";
+				i++;
+			} else if (c === "$" && content[i + 1] === "{") {
+				templates.push(depth);
+				quote = "";
+				depth = 0;
+				i += 2;
+			} else i++;
+		} else if (c === "/" && content[i + 1] === "/") {
+			comment = "line";
+			i += 2;
+		} else if (c === "/" && content[i + 1] === "*") {
+			comment = "block";
+			i += 2;
+		} else if (c === "'" || c === '"' || c === "`") {
+			quote = c;
+			i++;
+		} else if (c === "{") {
+			depth++;
+			i++;
+		} else if (c === "}") {
+			if (depth === 0 && templates.length > 0) {
+				depth = templates.pop()!;
+				quote = "`";
+			} else if (depth > 0) depth--;
+			i++;
+		} else if (
+			(i === from || content[i - 1] === "\n") &&
+			content.startsWith("---", i) &&
+			/^[ \t]*(?:\r?\n|$)/.test(content.slice(i + 3))
+		) {
+			return i;
+		} else i++;
+	}
+	return undefined;
+}
+
 export function extractAstro(content: string): AstroExtraction {
 	const segments: AstroSegment[] = [];
 	const expressions: AstroSegment[] = [];
@@ -268,22 +334,10 @@ export function extractAstro(content: string): AstroExtraction {
 		return close + 1;
 	};
 	let i = 0;
-	if (/^---[ \t]*(?:\r?\n|$)/.test(content)) {
-		const firstLineEnd = content.indexOf("\n");
-		const openEnd = firstLineEnd === -1 ? content.length : firstLineEnd + 1;
-		let lineStart = openEnd;
-		let close: number | undefined;
-		for (;;) {
-			const newline = content.indexOf("\n", lineStart);
-			const end = newline === -1 ? content.length : newline;
-			const line = content.slice(lineStart, end).replace(/\r$/, "");
-			if (/^---[ \t]*$/.test(line)) {
-				close = lineStart;
-				break;
-			}
-			if (newline === -1) break;
-			lineStart = newline + 1;
-		}
+	const open = /^(?:\uFEFF|[ \t\r\n])*?---[ \t]*(?:\r?\n|$)/.exec(content);
+	if (open) {
+		const openEnd = open.index + open[0].length;
+		const close = frontmatterClose(content, openEnd);
 		if (close === undefined) return fail("unterminated frontmatter fence");
 		segments.push({ code: content.slice(openEnd, close), original: openEnd });
 		const lastLineEnd = content.indexOf("\n", close);
@@ -416,7 +470,7 @@ export function extractAstro(content: string): AstroExtraction {
 			continue;
 		}
 		const lower = name.toLowerCase();
-		if (lower === "style" && !selfClosed) {
+		if (name === "style" && !selfClosed) {
 			const close = closingTag(content, "style", k);
 			if (close === undefined) return fail("unterminated <style> block");
 			const end = content.indexOf(">", close);
