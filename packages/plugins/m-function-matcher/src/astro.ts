@@ -28,27 +28,96 @@ export type AstroExtraction = {
 const isSpace = (c: string | undefined) =>
 	c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
 
+const voidElements = new Set([
+	"area",
+	"base",
+	"br",
+	"col",
+	"embed",
+	"hr",
+	"img",
+	"input",
+	"link",
+	"meta",
+	"param",
+	"source",
+	"track",
+	"wbr",
+]);
+const dataScriptTypes = new Set([
+	"application/ld+json",
+	"application/json",
+	"importmap",
+	"speculationrules",
+	"text/plain",
+	"text/html",
+	"text/template",
+	"text/x-template",
+]);
+const regexPrefixKeywords = new Set([
+	"return",
+	"throw",
+	"case",
+	"delete",
+	"void",
+	"typeof",
+	"instanceof",
+	"in",
+	"of",
+	"yield",
+	"await",
+	"new",
+]);
+
+/** Skip a regexp token, including escapes, character classes and flags. */
+function skipRegExp(content: string, start: number): number | undefined {
+	let inClass = false;
+	for (let i = start + 1; i < content.length; i++) {
+		const c = content[i];
+		if (c === "\\") i++;
+		else if (c === "\n" || c === "\r") return undefined;
+		else if (c === "[") inClass = true;
+		else if (c === "]") inClass = false;
+		else if (c === "/" && !inClass) {
+			i++;
+			while (/[a-z]/i.test(content[i] ?? "")) i++;
+			return i;
+		}
+	}
+	return undefined;
+}
+
 /** The index of the `}` matching `content[open]`, or undefined at the end of input. */
 function findExpressionEnd(
 	content: string,
 	open: number,
 	failures: AstroFailure[],
-	edits?: AstroEdit[],
+	edits?: AstroEdit[]
 ): number | undefined {
 	let depth = 0;
 	let i = open;
+	let regexAllowed = true;
+	let afterDot = false;
 	while (i < content.length) {
 		const c = content[i];
+		if (isSpace(c)) {
+			i++;
+			continue;
+		}
 		if (c === "'" || c === '"') {
 			const end = skipQuoted(content, i);
 			if (end === undefined) return undefined;
 			i = end;
+			regexAllowed = false;
+			afterDot = false;
 			continue;
 		}
 		if (c === "`") {
 			const end = skipTemplate(content, i, failures, edits);
 			if (end === undefined) return undefined;
 			i = end;
+			regexAllowed = false;
+			afterDot = false;
 			continue;
 		}
 		if (c === "/" && content[i + 1] === "/") {
@@ -63,6 +132,22 @@ function findExpressionEnd(
 			i = close + 2;
 			continue;
 		}
+		if (c === "/" && regexAllowed) {
+			const end = skipRegExp(content, i);
+			if (end === undefined) return undefined;
+			i = end;
+			regexAllowed = false;
+			afterDot = false;
+			continue;
+		}
+		if (/[a-zA-Z_$]/.test(c ?? "")) {
+			const start = i++;
+			while (/[a-zA-Z0-9_$]/.test(content[i] ?? "")) i++;
+			regexAllowed =
+				!afterDot && regexPrefixKeywords.has(content.slice(start, i));
+			afterDot = false;
+			continue;
+		}
 		if (c === "<" && /[a-zA-Z>]/.test(content[i + 1] ?? "")) {
 			let before = i - 1;
 			while (before > open && isSpace(content[before])) before--;
@@ -71,6 +156,8 @@ function findExpressionEnd(
 				const end = skipElement(content, i, failures, edits);
 				if (end !== undefined) {
 					i = end;
+					regexAllowed = false;
+					afterDot = false;
 					continue;
 				}
 				if (edits) edits.length = count;
@@ -81,6 +168,14 @@ function findExpressionEnd(
 			depth--;
 			if (depth === 0) return i;
 		}
+		// A slash after a value is division; after an operator it starts a regexp.
+		// Keep postfix ++/-- as value tokens rather than treating their slash as a regexp.
+		if ((c === "+" || c === "-") && content[i + 1] === c) {
+			i += 2;
+			continue;
+		}
+		regexAllowed = /[([{=,:;!?&|+*%\^~<>\/-]/.test(c ?? "");
+		afterDot = c === ".";
 		i++;
 	}
 	return undefined;
@@ -101,7 +196,7 @@ function skipTemplate(
 	content: string,
 	start: number,
 	failures: AstroFailure[],
-	edits?: AstroEdit[],
+	edits?: AstroEdit[]
 ): number | undefined {
 	for (let i = start + 1; i < content.length; i++) {
 		const c = content[i];
@@ -121,11 +216,12 @@ function skipElement(
 	content: string,
 	start: number,
 	failures: AstroFailure[],
-	edits?: AstroEdit[],
+	edits?: AstroEdit[]
 ): number | undefined {
 	let i = start + 1;
 	while (/[a-zA-Z0-9_.:-]/.test(content[i] ?? "")) i++;
-	if (content.slice(start + 1, i).toLowerCase() === "script")
+	const name = content.slice(start + 1, i);
+	if (name === "script")
 		failures.push({
 			reason: "Nested Astro scripts cannot be analyzed.",
 			start,
@@ -182,6 +278,10 @@ function skipElement(
 		}
 	}
 	if (content[i] !== ">") return undefined;
+	if (voidElements.has(name)) {
+		edits?.push({ start: i, end: i, code: "/" });
+		return i + 1;
+	}
 	i++;
 	while (i < content.length) {
 		if (content.startsWith("<!--", i)) {
@@ -216,7 +316,7 @@ function expressionSegment(
 	content: string,
 	start: number,
 	end: number,
-	edits: AstroEdit[],
+	edits: AstroEdit[]
 ): AstroSegment {
 	if (edits.length === 0)
 		return { code: content.slice(start, end), original: start };
@@ -244,7 +344,7 @@ function closingTag(
 	name: string,
 	from: number
 ): number | undefined {
-	const pattern = new RegExp(`</${name}`, "gi");
+	const pattern = new RegExp(`</${name}(?=[\\t\\r\\n\\f />])`, "gi");
 	pattern.lastIndex = from;
 	return pattern.exec(content)?.index;
 }
@@ -254,63 +354,65 @@ function closingTag(
  * strings, template literals and comments.
  */
 function frontmatterClose(content: string, from: number): number | undefined {
-	let quote = "";
-	let comment: "" | "line" | "block" = "";
-	let depth = 0;
-	const templates: number[] = [];
 	let i = from;
+	let regexAllowed = true;
+	let afterDot = false;
 	while (i < content.length) {
 		const c = content[i]!;
-		if (comment === "line") {
-			if (c === "\n") comment = "";
-			i++;
-		} else if (comment === "block") {
-			if (c === "*" && content[i + 1] === "/") {
-				comment = "";
-				i += 2;
-			} else i++;
-		} else if (quote === "'" || quote === '"') {
-			if (c === "\\") i += 2;
-			else if (c === quote) {
-				quote = "";
-				i++;
-			} else i++;
-		} else if (quote === "`") {
-			if (c === "\\") i += 2;
-			else if (c === "`") {
-				quote = "";
-				i++;
-			} else if (c === "$" && content[i + 1] === "{") {
-				templates.push(depth);
-				quote = "";
-				depth = 0;
-				i += 2;
-			} else i++;
-		} else if (c === "/" && content[i + 1] === "/") {
-			comment = "line";
-			i += 2;
-		} else if (c === "/" && content[i + 1] === "*") {
-			comment = "block";
-			i += 2;
-		} else if (c === "'" || c === '"' || c === "`") {
-			quote = c;
-			i++;
-		} else if (c === "{") {
-			depth++;
-			i++;
-		} else if (c === "}") {
-			if (depth === 0 && templates.length > 0) {
-				depth = templates.pop()!;
-				quote = "`";
-			} else if (depth > 0) depth--;
-			i++;
-		} else if (
+		if (
 			(i === from || content[i - 1] === "\n") &&
 			content.startsWith("---", i) &&
 			/^[ \t]*(?:\r?\n|$)/.test(content.slice(i + 3))
-		) {
+		)
 			return i;
-		} else i++;
+		if (isSpace(c)) {
+			i++;
+			continue;
+		}
+		if (c === "'" || c === '"' || c === "`") {
+			const end =
+				c === "`" ? skipTemplate(content, i, []) : skipQuoted(content, i);
+			if (end === undefined) return undefined;
+			i = end;
+			regexAllowed = false;
+			afterDot = false;
+			continue;
+		}
+		if (c === "/" && content[i + 1] === "/") {
+			const end = content.indexOf("\n", i + 2);
+			if (end === -1) return undefined;
+			i = end + 1;
+			continue;
+		}
+		if (c === "/" && content[i + 1] === "*") {
+			const end = content.indexOf("*/", i + 2);
+			if (end === -1) return undefined;
+			i = end + 2;
+			continue;
+		}
+		if (c === "/" && regexAllowed) {
+			const end = skipRegExp(content, i);
+			if (end === undefined) return undefined;
+			i = end;
+			regexAllowed = false;
+			afterDot = false;
+			continue;
+		}
+		if (/[a-zA-Z_$]/.test(c)) {
+			const start = i++;
+			while (/[a-zA-Z0-9_$]/.test(content[i] ?? "")) i++;
+			regexAllowed =
+				!afterDot && regexPrefixKeywords.has(content.slice(start, i));
+			afterDot = false;
+			continue;
+		}
+		if ((c === "+" || c === "-") && content[i + 1] === c) {
+			i += 2;
+			continue;
+		}
+		regexAllowed = /[([{=,:;!?&|+*%\^~<>\/-]/.test(c);
+		afterDot = c === ".";
+		i++;
 	}
 	return undefined;
 }
@@ -387,6 +489,9 @@ export function extractAstro(content: string): AstroExtraction {
 		let k = nameEnd;
 		let selfClosed = false;
 		let external = false;
+		let scriptType: string | undefined;
+		let scriptTypeSeen = false;
+		let uncertainScriptAttributes = false;
 		while (k < content.length) {
 			while (k < content.length && isSpace(content[k])) k++;
 			const ac = content[k];
@@ -401,6 +506,14 @@ export function extractAstro(content: string): AstroExtraction {
 				break;
 			}
 			if (ac === "{") {
+				if (name === "script") {
+					uncertainScriptAttributes = true;
+					failures.push({
+						reason: "Dynamic Astro script attributes cannot be analyzed.",
+						start: k,
+						end: k + 1,
+					});
+				}
 				const next = collectExpression(k);
 				if (next === undefined) return fail("unterminated expression");
 				k = next;
@@ -422,9 +535,13 @@ export function extractAstro(content: string): AstroExtraction {
 				k++;
 				continue;
 			}
-			const attrName = content.slice(attrStart, k);
-			if (attrName === "src" && name.toLowerCase() === "script")
-				external = true;
+			const attrName = content.slice(attrStart, k).toLowerCase();
+			if (attrName === "type") {
+				if (scriptTypeSeen) uncertainScriptAttributes = true;
+				scriptTypeSeen = true;
+				scriptType = undefined;
+			}
+			if (attrName === "src" && name === "script") external = true;
 			let value = k;
 			while (value < content.length && isSpace(content[value])) value++;
 			if (content[value] !== "=") {
@@ -437,6 +554,7 @@ export function extractAstro(content: string): AstroExtraction {
 			if (vc === '"' || vc === "'") {
 				const closeQ = content.indexOf(vc, value + 1);
 				if (closeQ === -1) return fail("unterminated attribute value");
+				if (attrName === "type") scriptType = content.slice(value + 1, closeQ);
 				k = closeQ + 1;
 			} else if (vc === "`") {
 				const edits: AstroEdit[] = [];
@@ -449,12 +567,14 @@ export function extractAstro(content: string): AstroExtraction {
 				if (next === undefined) return fail("unterminated expression");
 				k = next;
 			} else {
+				const valueStart = value;
 				while (
 					value < content.length &&
 					!isSpace(content[value]) &&
 					content[value] !== ">"
 				)
 					value++;
+				if (attrName === "type") scriptType = content.slice(valueStart, value);
 				k = value;
 			}
 		}
@@ -469,7 +589,6 @@ export function extractAstro(content: string): AstroExtraction {
 			i = k;
 			continue;
 		}
-		const lower = name.toLowerCase();
 		if (name === "style" && !selfClosed) {
 			const close = closingTag(content, "style", k);
 			if (close === undefined) return fail("unterminated <style> block");
@@ -478,7 +597,7 @@ export function extractAstro(content: string): AstroExtraction {
 			i = end + 1;
 			continue;
 		}
-		if (lower === "script" && external) {
+		if (name === "script" && external) {
 			failures.push({
 				reason: "External Astro scripts cannot be analyzed.",
 				start: i,
@@ -487,12 +606,22 @@ export function extractAstro(content: string): AstroExtraction {
 			i = k;
 			continue;
 		}
-		if (lower === "script" && !selfClosed) {
+		if (name === "script" && !selfClosed) {
 			const close = closingTag(content, "script", k);
 			if (close === undefined) return fail("unterminated <script> block");
 			const end = content.indexOf(">", close);
 			if (end === -1) return fail("unterminated <script> block");
-			segments.push({ code: content.slice(k, close), original: k });
+			// Non-JavaScript MIME types (JSON-LD, import maps, templates) are data,
+			// not programs. Attribute expressions were collected above either way.
+			const type = scriptType?.split(";", 1)[0]!.trim().toLowerCase();
+			const dataBlock =
+				!uncertainScriptAttributes &&
+				type !== undefined &&
+				dataScriptTypes.has(type);
+			// Unknown/dynamic types keep the conservative program parser rather than
+			// silently hiding code in an executable type we did not recognize.
+			if (!dataBlock)
+				segments.push({ code: content.slice(k, close), original: k });
 			i = end + 1;
 			continue;
 		}

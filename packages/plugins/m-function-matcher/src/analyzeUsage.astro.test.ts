@@ -358,3 +358,96 @@ let key;
 		},
 	]);
 });
+
+test.each([
+	'<img alt={m.photo()} src="photo.png">',
+	"<div><br>{m.photo()}</div>",
+	"<input placeholder={m.photo()}>",
+])("normalizes void HTML elements inside expressions: %s", async (markup) => {
+	const content = `{true && ${markup}}<p>{m.after()}</p>`;
+	const result = await analyze(content);
+	expect(result.status).toBe("complete");
+	expect(new Set(result.usedBundleIds)).toEqual(new Set(["photo", "after"]));
+	for (const ref of result.references ?? []) {
+		expect(content.slice(ref.start.column, ref.end.column)).toBe(
+			`m.${ref.bundleId}()`
+		);
+	}
+});
+
+test.each([
+	'type="application/ld+json"',
+	"type='application/json'",
+	"type=application/ld+json",
+	'type="importmap"',
+	'type="speculationrules"',
+])("treats non-executable scripts as literal data: %s", async (attribute) => {
+	const result = await analyze(
+		`<script ${attribute}>{"value":"{m.literal()}","tag":"</scripture>"}</script><p>{m.real()}</p>`
+	);
+	expect(result.status).toBe("complete");
+	expect(result.usedBundleIds).toEqual(["real"]);
+});
+
+test.each(["Script", "SCRIPT", "sCript"])(
+	"keeps %s component children as Astro markup",
+	async (name) => {
+		const result = await analyze(`<${name}><div>{m.real()}</div></${name}>`);
+		expect(result.status).toBe("complete");
+		expect(result.usedBundleIds).toEqual(["real"]);
+	}
+);
+
+test.each([
+	String.raw`/}/.test(value) ? m.yes() : m.no()`,
+	String.raw`/[{}'"/]/.test(value) ? m.yes() : m.no()`,
+	String.raw`/\/}/.test(value) ? m.yes() : m.no()`,
+	String.raw`total / 2 + (/}/.test(value) ? m.yes() : m.no())`,
+	String.raw`(() => { return /}/.test(value) ? m.yes() : m.no(); })()`,
+])(
+	"delimits regex literals without confusing division: %s",
+	async (expression) => {
+		const result = await analyze(`<p>{${expression}}</p>`);
+		expect(result.status).toBe("complete");
+		expect(new Set(result.usedBundleIds)).toEqual(new Set(["yes", "no"]));
+	}
+);
+
+test("frontmatter regex quotes and comment markers cannot hide the fence", async () => {
+	const result = await analyze(String.raw`---
+const regex = /['"/*{}]/;
+const ratio = total / 2;
+const label = m.frontmatter();
+---
+<p>{m.body()}</p>`);
+	expect(result.status).toBe("complete");
+	expect(new Set(result.usedBundleIds)).toEqual(
+		new Set(["frontmatter", "body"])
+	);
+});
+
+test.each([
+	'type="module"',
+	'type="text/javascript"',
+	'type="unknown"',
+	"type={scriptType}",
+])(
+	"continues to analyze executable and unknown script types: %s",
+	async (attribute) => {
+		const result = await analyze(`<script ${attribute}>m.client();</script>`);
+		expect(result.status).toBe("complete");
+		expect(result.usedBundleIds).toEqual(["client"]);
+	}
+);
+
+
+test("dynamic script attributes cannot hide executable code behind a static data type", async () => {
+ const result = await analyze('<script {...attributes} type="application/json">m.client();</script>');
+ expect(result.status).toBe("incomplete");
+ expect(result.usedBundleIds).toEqual(["client"]);
+});
+
+test("duplicate script types cannot hide executable code", async () => {
+ const result = await analyze('<script TYPE="module" type="application/json">m.client();</script>');
+ expect(result.usedBundleIds).toEqual(["client"]);
+});
